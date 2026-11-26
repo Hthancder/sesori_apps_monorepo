@@ -59,13 +59,16 @@ jobs:
           python3 - <<'PY'
           import json
           import plistlib
+          import subprocess
           import sys
+          import zipfile
           from pathlib import Path
 
           sys.path.insert(0, ".github/scripts")
           from package_ios_ipa import is_static_archive
 
           app = Path("client/app/build/ios/iphoneos/Runner.app")
+          diagnostics = []
           for path in sorted((app / "Frameworks").glob("*.framework/Info.plist")):
               info = plistlib.loads(path.read_bytes())
               name = info.get("CFBundleExecutable")
@@ -78,11 +81,33 @@ jobs:
                                 "binaryPresent": present, "headerHex": header,
                                 "staticArchive": is_static_archive(path=binary) if present else False,
                                 "entries": sorted(item.name for item in path.parent.iterdir())}))
+              if present and info.get("MinimumOSVersion") == "100.0":
+                  diagnostics.extend((path, binary))
+                  print(f"Native framework inspection: {path.parent.name}", flush=True)
+                  subprocess.run(["file", str(binary)], check=True)
+                  subprocess.run(["xcrun", "otool", "-hv", "-l", "-L", str(binary)], check=True)
+          if diagnostics:
+              print("App runtime dependencies", flush=True)
+              subprocess.run(["xcrun", "otool", "-L", str(app / "Runner")], check=True)
+              output = Path("build/ios-framework-diagnostics.zip")
+              output.parent.mkdir(parents=True, exist_ok=True)
+              with zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+                  for path in diagnostics:
+                      archive.write(path, path.relative_to(app).as_posix())
           PY
           python3 .github/scripts/package_ios_ipa.py \
             --app client/app/build/ios/iphoneos/Runner.app \
             --output build/ios-private-ipa \
             --commit "$BUILD_COMMIT" --run-url "$BUILD_RUN_URL"
+
+      - name: Upload failed-build framework diagnostics
+        if: failure() && hashFiles('build/ios-framework-diagnostics.zip') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-framework-diagnostics-${{ github.run_number }}
+          path: build/ios-framework-diagnostics.zip
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload IPA, checksum and provenance
         id: artifact
