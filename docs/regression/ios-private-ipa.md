@@ -14,7 +14,13 @@ unverified device-installation status. Downloads require GitHub login and
 expire after 30 days. This workflow does not create a public release.
 
 The packaging boundary rejects simulator builds, missing Flutter binaries or
-assets, binaries without arm64, and bundle minimum OS declarations above 15.0.
+assets, binaries without arm64, and runtime bundle minimum OS declarations above 15.0.
+Frameworks whose executable is a static archive (`!<arch>`) are link-time inputs,
+not iOS runtime frameworks; the export omits those framework directories and
+records them in `excludedStaticFrameworks`. The original build is not modified,
+separate resource bundles remain, and runtime framework checks are not relaxed.
+This handles the FirebaseAnalytics 13.2.0 static framework's `100.0` declaration
+without rewriting its metadata (Apple TN2435, "Embedded Static Libraries").
 It refuses to overwrite an existing output directory. Tests use tiny fixture
 bundles only; the delivered artifact must come from `flutter build ios`.
 

@@ -58,14 +58,27 @@ def package(*, app: Path, output: Path, commit: str, run_url: str) -> dict:
     assets = app / "Frameworks/App.framework/flutter_assets"
     if not assets.is_dir() or not any(path.is_file() for path in assets.rglob("*")):
         raise ValueError("Missing Flutter assets")
+    excluded_static_frameworks = []
     for plist in sorted((app / "Frameworks").glob("*.framework/Info.plist")):
         framework_info = read_info(path=plist)
+        framework_executable = framework_info.get("CFBundleExecutable")
+        if isinstance(framework_executable, str) and Path(framework_executable).name == framework_executable:
+            binary = plist.parent / framework_executable
+            if binary.is_file() and binary.relative_to(app).as_posix() not in required:
+                with binary.open("rb") as stream:
+                    is_static_archive = stream.read(8) == b"!<arch>\n"
+                if is_static_archive:
+                    # Static link inputs are already linked into the app, not runtime frameworks.
+                    # Apple TN2435: static frameworks must not be embedded in an iOS app.
+                    excluded_static_frameworks.append(plist.parent)
+                    continue
         # Some third-party frameworks omit this key; the app and Flutter engine do not.
         if "MinimumOSVersion" in framework_info:
             check_minimum_ios(info=framework_info, path=plist)
 
     binaries = []
-    files = sorted(app.rglob("*"))
+    files = [path for path in sorted(app.rglob("*"))
+             if not any(path.is_relative_to(framework) for framework in excluded_static_frameworks)]
     for path in files:
         if not path.is_file() or path.is_symlink():
             continue
@@ -113,6 +126,7 @@ def package(*, app: Path, output: Path, commit: str, run_url: str) -> dict:
         "commit": commit, "runUrl": run_url, "bundleIdentifier": info["CFBundleIdentifier"],
         "version": version, "build": build, "minimumOSVersion": info["MinimumOSVersion"],
         "signing": "unsigned", "deviceInstallationVerified": False, "nativeBinaries": binaries,
+        "excludedStaticFrameworks": [path.relative_to(app).as_posix() for path in excluded_static_frameworks],
     }
     (output / "SHA256SUMS").write_text(f"{digest}  {ipa.name}\n", encoding="utf-8")
     (output / "build-info.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

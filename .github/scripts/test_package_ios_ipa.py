@@ -98,6 +98,49 @@ class IosIpaPackagingTests(unittest.TestCase):
         self.assertIn("iPhoneOS device", result.stderr)
         self.assertFalse(self.output.exists())
 
+    def test_excludes_static_link_inputs_without_changing_the_built_app(self):
+        framework = self.app / "Frameworks/FirebaseAnalytics.framework"
+        self.write_plist(framework / "Info.plist", {
+            "CFBundleExecutable": "FirebaseAnalytics", "MinimumOSVersion": "100.0",
+        })
+        static_binary = framework / "FirebaseAnalytics"
+        static_binary.write_bytes(b"!<arch>\n" + b"fixture static link input")
+        bundle = self.app / "FirebaseAnalyticsResources.bundle"
+        bundle.mkdir()
+        (bundle / "PrivacyInfo.xcprivacy").write_bytes(b"fixture resource")
+
+        result = self.run_packager()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads((self.output / "build-info.json").read_text())
+        self.assertEqual(report["excludedStaticFrameworks"], [
+            "Frameworks/FirebaseAnalytics.framework",
+        ])
+        with zipfile.ZipFile(self.output / report["artifact"]) as archive:
+            self.assertFalse(any("FirebaseAnalytics.framework" in name for name in archive.namelist()))
+            self.assertEqual(archive.read("Payload/Runner.app/FirebaseAnalyticsResources.bundle/PrivacyInfo.xcprivacy"),
+                             b"fixture resource")
+            self.assertIn("Payload/Runner.app/Frameworks/Flutter.framework/Flutter", archive.namelist())
+        self.assertEqual(static_binary.read_bytes(), b"!<arch>\n" + b"fixture static link input")
+        self.assertEqual(plistlib.loads((framework / "Info.plist").read_bytes())["MinimumOSVersion"], "100.0")
+
+    def test_firebase_dynamic_framework_still_must_support_ios15(self):
+        framework = self.app / "Frameworks/FirebaseAnalytics.framework"
+        self.write_plist(framework / "Info.plist", {
+            "CFBundleExecutable": "FirebaseAnalytics", "MinimumOSVersion": "100.0",
+        })
+        self.write_binary(framework / "FirebaseAnalytics")
+        result = self.run_packager()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("iOS 15", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_required_flutter_binary_cannot_be_replaced_by_static_link_input(self):
+        (self.app / "Frameworks/App.framework/App").write_bytes(b"!<arch>\nfixture")
+        result = self.run_packager()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("arm64", result.stderr)
+        self.assertFalse(self.output.exists())
+
     def test_rejects_x64_in_embedded_framework_before_export(self):
         self.write_binary(self.app / "Frameworks/App.framework/App", cpu=0x01000007)
         result = self.run_packager()
