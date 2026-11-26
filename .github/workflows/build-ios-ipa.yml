@@ -1,0 +1,83 @@
+name: Build private iOS IPA
+
+# Manual artifact export only. No Apple, TestFlight, or attribution credentials.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: iOS 15 arm64 unsigned IPA
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Test IPA export contract
+        run: python3 -m unittest discover -s .github/scripts -p test_package_ios_ipa.py -v
+
+      - name: Select native Xcode
+        uses: ./.github/actions/setup-xcode
+
+      - name: Set up pinned Flutter and workspace
+        uses: ./.github/actions/setup-flutter
+
+      - name: Prefetch native libraries for tests
+        uses: ./.github/actions/prefetch-sqlite3-native
+        with:
+          workspace: client
+
+      - name: Test existing session resynchronization
+        working-directory: client/module_core
+        run: dart test test/cubits/session_detail/transcript_builder_test.dart test/cubits/session_detail/transcript_turns_test.dart
+
+      - name: Prefetch native libraries for iOS
+        uses: ./.github/actions/prefetch-sqlite3-native
+        with:
+          workspace: client
+          platform: ios
+
+      - name: Cache SwiftPM release artifacts
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm/artifacts/https___github_com_*
+          key: swiftpm-github-artifacts-ios-${{ hashFiles('client/app/ios/Runner.xcworkspace/xcshareddata/swiftpm/Package.resolved', 'client/pubspec.lock') }}
+
+      - name: Build real iPhone app without signing
+        working-directory: client/app
+        run: flutter build ios --release --no-codesign
+
+      - name: Package and inspect IPA
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
+          BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/scripts/package_ios_ipa.py \
+            --app client/app/build/ios/iphoneos/Runner.app \
+            --output build/ios-private-ipa \
+            --commit "$BUILD_COMMIT" --run-url "$BUILD_RUN_URL"
+
+      - name: Upload IPA, checksum and provenance
+        id: artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Sesori-ios15-arm64-unsigned-${{ github.run_number }}
+          path: build/ios-private-ipa/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Download and signing status
+        env:
+          ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        run: |
+          {
+            echo '## Unsigned iOS 15 arm64 IPA'
+            echo "[Download IPA, SHA256SUMS and build-info.json]($ARTIFACT_URL)"
+            echo 'No TestFlight upload. Signing and installation have NOT been verified.'
+            echo 'Use a compatible signer or jailbreak installer; this is not an App Store-signed IPA.'
+            cat build/ios-private-ipa/SHA256SUMS
+          } >> "$GITHUB_STEP_SUMMARY"
