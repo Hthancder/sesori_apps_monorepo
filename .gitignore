@@ -51,3 +51,26 @@ Icon
 # Built Visual Studio Code Extensions
 *.vsix
 .opencode/package-lock.json
+
+### Local secrets and private diagnostic captures
+.env*
+!.env.example
+!.env.sample
+!.env.template
+*credentials*
+*credential*
+*service-account*.json
+*service_account*.json
+auth.json
+secrets*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_*
+.npmrc
+.netrc
+*.pcap
+*.pcapng

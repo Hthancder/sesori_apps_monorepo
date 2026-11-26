@@ -56,6 +56,24 @@ jobs:
           BUILD_COMMIT: ${{ github.sha }}
           BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          python3 - <<'PY'
+          import json
+          import plistlib
+          from pathlib import Path
+
+          app = Path("client/app/build/ios/iphoneos/Runner.app")
+          for path in sorted((app / "Frameworks").glob("*.framework/Info.plist")):
+              info = plistlib.loads(path.read_bytes())
+              name = info.get("CFBundleExecutable")
+              binary = path.parent / name if isinstance(name, str) and Path(name).name == name else None
+              present = binary is not None and binary.is_file()
+              with binary.open("rb") if present else open("/dev/null", "rb") as stream:
+                  header = stream.read(8).hex()
+              print(json.dumps({"framework": path.parent.name, "executable": name,
+                                "minimumOSVersion": info.get("MinimumOSVersion"),
+                                "binaryPresent": present, "headerHex": header,
+                                "entries": sorted(item.name for item in path.parent.iterdir())}))
+          PY
           python3 .github/scripts/package_ios_ipa.py \
             --app client/app/build/ios/iphoneos/Runner.app \
             --output build/ios-private-ipa \
