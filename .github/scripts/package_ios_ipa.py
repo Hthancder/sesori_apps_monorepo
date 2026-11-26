@@ -7,6 +7,7 @@ import os
 import plistlib
 import re
 import shutil
+import struct
 import zipfile
 from pathlib import Path
 
@@ -25,6 +26,43 @@ def check_minimum_ios(*, info: dict, path: Path) -> None:
     parts = tuple(int(part) for part in version.split("."))
     if (parts + (0,) * (3 - len(parts))) > (15, 0, 0):
         raise ValueError(f"Bundle requires {version}, not iOS 15: {path}")
+
+
+def is_static_archive(*, path: Path) -> bool:
+    """Recognize both plain archives and universal wrappers around archives."""
+    with path.open("rb") as stream:
+        header = stream.read(8)
+        if header == b"!<arch>\n":
+            return True
+        formats = {b"\xca\xfe\xba\xbe": ">IIIII", b"\xca\xfe\xba\xbf": ">IIQQII"}
+        record_format = formats.get(header[:4])
+        if record_format is None or len(header) != 8:
+            return False
+        count = struct.unpack_from(">I", header, 4)[0]
+        record_size = struct.calcsize(record_format)
+        table_end = 8 + count * record_size
+        file_size = os.fstat(stream.fileno()).st_size
+        if count == 0 or table_end > file_size:
+            return False
+        architectures = set()
+        ranges = []
+        for index in range(count):
+            stream.seek(8 + index * record_size)
+            record = stream.read(record_size)
+            if len(record) != record_size:
+                return False
+            cpu, subtype, offset, size, *_ = struct.unpack(record_format, record)
+            if (cpu, subtype) in architectures:
+                return False
+            architectures.add((cpu, subtype))
+            if offset < table_end or size < 8 or offset + size > file_size:
+                return False
+            ranges.append((offset, offset + size))
+            stream.seek(offset)
+            if stream.read(8) != b"!<arch>\n":
+                return False
+        ranges.sort()
+        return all(left[1] <= right[0] for left, right in zip(ranges, ranges[1:]))
 
 
 def package(*, app: Path, output: Path, commit: str, run_url: str) -> dict:
@@ -65,9 +103,7 @@ def package(*, app: Path, output: Path, commit: str, run_url: str) -> dict:
         if isinstance(framework_executable, str) and Path(framework_executable).name == framework_executable:
             binary = plist.parent / framework_executable
             if binary.is_file() and binary.relative_to(app).as_posix() not in required:
-                with binary.open("rb") as stream:
-                    is_static_archive = stream.read(8) == b"!<arch>\n"
-                if is_static_archive:
+                if is_static_archive(path=binary):
                     # Static link inputs are already linked into the app, not runtime frameworks.
                     # Apple TN2435: static frameworks must not be embedded in an iOS app.
                     excluded_static_frameworks.append(plist.parent)
@@ -83,6 +119,8 @@ def package(*, app: Path, output: Path, commit: str, run_url: str) -> dict:
         if not path.is_file() or path.is_symlink():
             continue
         relative = path.relative_to(app).as_posix()
+        if relative in required and is_static_archive(path=path):
+            raise ValueError(f"Expected arm64 Mach-O binary, not a static archive: {relative}")
         native = native_arch(path=path)
         if native is None:
             if relative in required or path.suffix == ".dylib":

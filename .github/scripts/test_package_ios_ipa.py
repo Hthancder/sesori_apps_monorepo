@@ -55,6 +55,21 @@ class IosIpaPackagingTests(unittest.TestCase):
         path.write_bytes(struct.pack("<8I", 0xFEEDFACF, cpu, 0, 2, 0, 0, 0, 0))
         path.chmod(0o755)
 
+    @staticmethod
+    def universal_binary(*slices, wide=False):
+        magic = 0xCAFEBABF if wide else 0xCAFEBABE
+        result = bytearray(struct.pack(">II", magic, len(slices)))
+        for index, data in enumerate(slices):
+            offset = 4096 * (index + 1)
+            if wide:
+                result.extend(struct.pack(">IIQQII", 0x0100000C, index, offset, len(data), 12, 0))
+            else:
+                result.extend(struct.pack(">IIIII", 0x0100000C, index, offset, len(data), 12))
+        for index, data in enumerate(slices):
+            result.extend(bytes(4096 * (index + 1) - len(result)))
+            result.extend(data)
+        return bytes(result)
+
     def run_packager(self):
         return subprocess.run([
             sys.executable, str(SCRIPT), "--app", str(self.app),
@@ -133,6 +148,85 @@ class IosIpaPackagingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("iOS 15", result.stderr)
         self.assertFalse(self.output.exists())
+
+    def test_excludes_universal_static_frameworks_without_mutating_the_build(self):
+        framework = self.app / "Frameworks/FirebaseAnalytics.framework"
+        self.write_plist(framework / "Info.plist", {
+            "CFBundleExecutable": "FirebaseAnalytics", "MinimumOSVersion": "100.0",
+        })
+        for wide in (False, True):
+            with self.subTest(wide=wide):
+                self.output = self.root / f"output-fat-{wide}"
+                binary = self.universal_binary(b"!<arch>\nfixture one", b"!<arch>\nfixture two", wide=wide)
+                (framework / "FirebaseAnalytics").write_bytes(binary)
+                result = self.run_packager()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                report = json.loads((self.output / "build-info.json").read_text())
+                self.assertEqual(report["excludedStaticFrameworks"], ["Frameworks/FirebaseAnalytics.framework"])
+                with zipfile.ZipFile(self.output / report["artifact"]) as archive:
+                    self.assertFalse(any("FirebaseAnalytics.framework" in name for name in archive.namelist()))
+                    self.assertIn("Payload/Runner.app/Frameworks/Flutter.framework/Flutter", archive.namelist())
+                self.assertEqual((framework / "FirebaseAnalytics").read_bytes(), binary)
+                self.assertEqual(plistlib.loads((framework / "Info.plist").read_bytes())["MinimumOSVersion"], "100.0")
+
+    def test_universal_dynamic_mixed_or_malformed_frameworks_are_not_static_exclusions(self):
+        framework = self.app / "Frameworks/FirebaseAnalytics.framework"
+        self.write_plist(framework / "Info.plist", {
+            "CFBundleExecutable": "FirebaseAnalytics", "MinimumOSVersion": "100.0",
+        })
+        dynamic = struct.pack("<8I", 0xFEEDFACF, 0x0100000C, 0, 6, 0, 0, 0, 0)
+        static = b"!<arch>\nfixture"
+        cases = {
+            "dynamic": self.universal_binary(dynamic),
+            "mixed": self.universal_binary(static, dynamic),
+            "truncated-table": struct.pack(">II", 0xCAFEBABE, 1),
+            "out-of-bounds": struct.pack(">7I", 0xCAFEBABE, 1, 0x0100000C, 0, 4096, 64, 12),
+            "table-as-slice": struct.pack(">7I", 0xCAFEBABE, 1, 0x0100000C, 0, 8, 8, 0),
+            "empty": struct.pack(">II", 0xCAFEBABE, 0),
+        }
+        for name, binary in cases.items():
+            with self.subTest(name=name):
+                (framework / "FirebaseAnalytics").write_bytes(binary)
+                result = self.run_packager()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("iOS 15", result.stderr)
+                self.assertFalse(self.output.exists())
+
+    def test_duplicate_or_overlapping_universal_slices_never_produce_an_ipa(self):
+        framework = self.app / "Frameworks/FirebaseAnalytics.framework"
+        self.write_plist(framework / "Info.plist", {
+            "CFBundleExecutable": "FirebaseAnalytics", "MinimumOSVersion": "100.0",
+        })
+        for wide in (False, True):
+            record_size = 32 if wide else 20
+            for defect in ("duplicate-architecture", "overlapping-slices"):
+                with self.subTest(wide=wide, defect=defect):
+                    self.output = self.root / f"output-{wide}-{defect}"
+                    binary = bytearray(self.universal_binary(
+                        b"!<arch>\nfixture one", b"!<arch>\nfixture two", wide=wide))
+                    second = 8 + record_size
+                    if defect == "duplicate-architecture":
+                        binary[second:second + 8] = binary[8:16]
+                    else:
+                        struct.pack_into(">Q" if wide else ">I", binary, second + 8, 4096)
+                    (framework / "FirebaseAnalytics").write_bytes(binary)
+                    result = self.run_packager()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("iOS 15", result.stderr)
+                    self.assertFalse(self.output.exists())
+
+    def test_required_binaries_cannot_be_replaced_by_universal_static_archives(self):
+        for relative in ("Runner", "Frameworks/App.framework/App", "Frameworks/Flutter.framework/Flutter"):
+            with self.subTest(relative=relative):
+                self.output = self.root / ("output-" + relative.replace("/", "-"))
+                path = self.app / relative
+                original = path.read_bytes()
+                path.write_bytes(self.universal_binary(b"!<arch>\nfixture"))
+                result = self.run_packager()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("arm64", result.stderr)
+                self.assertFalse(self.output.exists())
+                path.write_bytes(original)
 
     def test_required_flutter_binary_cannot_be_replaced_by_static_link_input(self):
         (self.app / "Frameworks/App.framework/App").write_bytes(b"!<arch>\nfixture")

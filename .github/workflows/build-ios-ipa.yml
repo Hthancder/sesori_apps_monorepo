@@ -59,7 +59,11 @@ jobs:
           python3 - <<'PY'
           import json
           import plistlib
+          import sys
           from pathlib import Path
+
+          sys.path.insert(0, ".github/scripts")
+          from package_ios_ipa import is_static_archive
 
           app = Path("client/app/build/ios/iphoneos/Runner.app")
           for path in sorted((app / "Frameworks").glob("*.framework/Info.plist")):
@@ -72,6 +76,7 @@ jobs:
               print(json.dumps({"framework": path.parent.name, "executable": name,
                                 "minimumOSVersion": info.get("MinimumOSVersion"),
                                 "binaryPresent": present, "headerHex": header,
+                                "staticArchive": is_static_archive(path=binary) if present else False,
                                 "entries": sorted(item.name for item in path.parent.iterdir())}))
           PY
           python3 .github/scripts/package_ios_ipa.py \
