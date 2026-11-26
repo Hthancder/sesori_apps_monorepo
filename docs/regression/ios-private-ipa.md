@@ -20,10 +20,22 @@ universal FAT32/FAT64 wrapper containing only static-archive slices, are link-ti
 not iOS runtime frameworks; the export omits those framework directories and
 records them in `excludedStaticFrameworks`. The original build is not modified,
 separate resource bundles remain, and runtime framework checks are not relaxed.
-This handles the FirebaseAnalytics 13.2.0 static framework's `100.0` declaration
-without rewriting its metadata (Apple TN2435, "Embedded Static Libraries").
+Static exclusion follows Apple TN2435, "Embedded Static Libraries"; it must not
+be inferred from the library's source package or name.
 Mixed, dynamic, truncated or out-of-bounds universal slices do not qualify for
 this exclusion. Required Runner/App/Flutter binaries cannot be static archives.
+
+The inspected Xcode build also embeds four empty analytics dylib stubs with
+an iOS `100.0` declaration: FirebaseAnalytics, GoogleAdsOnDeviceConversion,
+GoogleAppMeasurement and GoogleAppMeasurementIdentitySupport. Only those exact
+names can qualify for a separate exclusion, after checking their actual arm64
+Mach-O load commands, zero-sized text, zero symbols and empty exports. Every
+remaining native binary is inspected for load dependencies before export; a
+reference to a candidate stub rejects the export instead of dropping a runtime
+dependency. Unknown, code-bearing or referenced dylibs retain the iOS 15 gate.
+Omissions appear in `excludedEmptyStubFrameworks`, separately from static
+archives. Neither original binaries nor their deployment metadata are rewritten.
+
 It refuses to overwrite an existing output directory. Tests use tiny fixture
 bundles only; the delivered artifact must come from `flutter build ios`.
 

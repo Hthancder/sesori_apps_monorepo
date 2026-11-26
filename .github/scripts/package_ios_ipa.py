@@ -65,6 +65,126 @@ def is_static_archive(*, path: Path) -> bool:
         return all(left[1] <= right[0] for left, right in zip(ranges, ranges[1:]))
 
 
+def macho_commands(*, path: Path) -> list[tuple[int, int, int, list[bytes]]]:
+    """Read bounded 64-bit load commands, including each universal slice."""
+    with path.open("rb") as stream:
+        header = stream.read(8)
+        file_size = os.fstat(stream.fileno()).st_size
+        slices = [(0, file_size)]
+        formats = {b"\xca\xfe\xba\xbe": ">IIIII", b"\xca\xfe\xba\xbf": ">IIQQII"}
+        if header[:4] in formats:
+            record_format = formats[header[:4]]
+            record_size = struct.calcsize(record_format)
+            count = struct.unpack_from(">I", header, 4)[0]
+            table_end = 8 + count * record_size
+            if count == 0 or table_end > file_size:
+                raise ValueError(f"Invalid universal binary: {path}")
+            slices = []
+            architectures = set()
+            for index in range(count):
+                stream.seek(8 + index * record_size)
+                cpu, subtype, offset, size, *_ = struct.unpack(record_format, stream.read(record_size))
+                if ((cpu, subtype) in architectures or offset < table_end or size < 32
+                        or offset + size > file_size):
+                    raise ValueError(f"Invalid universal slice: {path}")
+                architectures.add((cpu, subtype))
+                slices.append((offset, size))
+            ranges = sorted(slices)
+            if any(left[0] + left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
+                raise ValueError(f"Overlapping universal slices: {path}")
+        result = []
+        for offset, size in slices:
+            stream.seek(offset)
+            header = stream.read(32)
+            if len(header) != 32 or header[:4] != b"\xcf\xfa\xed\xfe":
+                raise ValueError(f"Expected 64-bit Mach-O load commands: {path}")
+            _, cpu, _, filetype, count, length, _, _ = struct.unpack("<8I", header)
+            if length > size - 32 or count > length // 8:
+                raise ValueError(f"Invalid Mach-O load command bounds: {path}")
+            table = stream.read(length)
+            commands = []
+            position = 0
+            for _ in range(count):
+                if position + 8 > len(table):
+                    raise ValueError(f"Truncated Mach-O load command: {path}")
+                _, command_size = struct.unpack_from("<II", table, position)
+                if command_size < 8 or command_size % 8 or position + command_size > len(table):
+                    raise ValueError(f"Invalid Mach-O load command size: {path}")
+                commands.append(table[position:position + command_size])
+                position += command_size
+            if position != length:
+                raise ValueError(f"Unexpected Mach-O load command bytes: {path}")
+            result.append((offset, cpu, filetype, commands))
+        return result
+
+
+def dylib_name(*, command: bytes) -> str:
+    if len(command) < 24:
+        raise ValueError("Truncated Mach-O dylib command")
+    offset = struct.unpack_from("<I", command, 8)[0]
+    if not 24 <= offset < len(command) or b"\0" not in command[offset:]:
+        raise ValueError("Invalid Mach-O dylib name")
+    return command[offset:].split(b"\0", 1)[0].decode("utf-8")
+
+
+def is_empty_analytics_stub(*, path: Path, name: str) -> bool:
+    # These exact four built products were inspected in Actions run 45762104177.
+    # Xcode emitted empty dylibs for link-time analytics inputs, with minos 100.
+    if name not in {"FirebaseAnalytics", "GoogleAdsOnDeviceConversion",
+                    "GoogleAppMeasurement", "GoogleAppMeasurementIdentitySupport"}:
+        return False
+    try:
+        slices = macho_commands(path=path)
+        if len(slices) != 1:
+            return False
+        base, cpu, filetype, commands = slices[0]
+        if cpu != 0x0100000C or filetype != 6:
+            return False
+        found = set()
+        allowed = {0x19, 0xD, 0x80000034, 0x80000033, 2, 0xB, 0x1B,
+                   0x32, 0x2A, 0x2C, 0xC, 0x26, 0x29, 0x1D}
+        for command in commands:
+            kind = struct.unpack_from("<I", command)[0]
+            if kind not in allowed:
+                return False
+            if kind == 0x19:
+                if len(command) < 72 or command[8:24].rstrip(b"\0") not in (b"__TEXT", b"__LINKEDIT"):
+                    return False
+                count = struct.unpack_from("<I", command, 64)[0]
+                if len(command) != 72 + count * 80:
+                    return False
+                for index in range(count):
+                    section = command[72 + index * 80:152 + index * 80]
+                    if section[:16].rstrip(b"\0") != b"__text" or struct.unpack_from("<Q", section, 40)[0] != 0:
+                        return False
+                    found.add("empty-text")
+            elif kind in (0xC, 0xD):
+                expected = "/usr/lib/libSystem.B.dylib" if kind == 0xC else f"@rpath/{name}.framework/{name}"
+                if dylib_name(command=command) != expected:
+                    return False
+                found.add(kind)
+            elif kind == 2:
+                if len(command) != 24 or struct.unpack_from("<I", command, 12)[0] != 0:
+                    return False
+                found.add(kind)
+            elif kind == 0x80000033:
+                if len(command) != 16:
+                    return False
+                offset, length = struct.unpack_from("<II", command, 8)
+                with path.open("rb") as stream:
+                    stream.seek(base + offset)
+                    if length != 8 or stream.read(length) != bytes(8):
+                        return False
+                found.add(kind)
+            elif kind == 0x32:
+                if len(command) < 24 or struct.unpack_from("<II", command, 8) != (2, 100 << 16):
+                    return False
+                found.add(kind)
+        return found == {"empty-text", 0xC, 0xD, 2, 0x80000033, 0x32}
+    except (ValueError, struct.error):
+        return False
+
+
 def package(*, app: Path, output: Path, commit: str, run_url: str) -> dict:
     app = app.resolve()
     output = output.resolve()
@@ -97,6 +217,7 @@ def package(*, app: Path, output: Path, commit: str, run_url: str) -> dict:
     if not assets.is_dir() or not any(path.is_file() for path in assets.rglob("*")):
         raise ValueError("Missing Flutter assets")
     excluded_static_frameworks = []
+    excluded_empty_stubs = []
     for plist in sorted((app / "Frameworks").glob("*.framework/Info.plist")):
         framework_info = read_info(path=plist)
         framework_executable = framework_info.get("CFBundleExecutable")
@@ -108,13 +229,18 @@ def package(*, app: Path, output: Path, commit: str, run_url: str) -> dict:
                     # Apple TN2435: static frameworks must not be embedded in an iOS app.
                     excluded_static_frameworks.append(plist.parent)
                     continue
+                if (framework_info.get("MinimumOSVersion") == "100.0"
+                        and is_empty_analytics_stub(path=binary, name=framework_executable)):
+                    excluded_empty_stubs.append(plist.parent)
+                    continue
         # Some third-party frameworks omit this key; the app and Flutter engine do not.
         if "MinimumOSVersion" in framework_info:
             check_minimum_ios(info=framework_info, path=plist)
 
     binaries = []
     files = [path for path in sorted(app.rglob("*"))
-             if not any(path.is_relative_to(framework) for framework in excluded_static_frameworks)]
+             if not any(path.is_relative_to(framework)
+                        for framework in excluded_static_frameworks + excluded_empty_stubs)]
     for path in files:
         if not path.is_file() or path.is_symlink():
             continue
@@ -129,6 +255,15 @@ def package(*, app: Path, output: Path, commit: str, run_url: str) -> dict:
         binary_format, arches = native
         if binary_format != "Mach-O" or "arm64" not in arches:
             raise ValueError(f"Expected arm64 Mach-O binary: {relative}: {native}")
+        if excluded_empty_stubs:
+            for _, _, _, commands in macho_commands(path=path):
+                for command in commands:
+                    if struct.unpack_from("<I", command)[0] not in (0xC, 0x80000018, 0x8000001F, 0x20, 0x80000023):
+                        continue
+                    dependency = dylib_name(command=command)
+                    for framework in excluded_empty_stubs:
+                        if dependency.endswith(f"/{framework.name}/{framework.stem}"):
+                            raise ValueError(f"Referenced framework requires iOS 100, not iOS 15: {dependency} from {relative}")
         binaries.append({"path": relative, "architectures": arches})
     native_paths = {entry["path"] for entry in binaries}
     if not required.issubset(native_paths):
@@ -165,6 +300,7 @@ def package(*, app: Path, output: Path, commit: str, run_url: str) -> dict:
         "version": version, "build": build, "minimumOSVersion": info["MinimumOSVersion"],
         "signing": "unsigned", "deviceInstallationVerified": False, "nativeBinaries": binaries,
         "excludedStaticFrameworks": [path.relative_to(app).as_posix() for path in excluded_static_frameworks],
+        "excludedEmptyStubFrameworks": [path.relative_to(app).as_posix() for path in excluded_empty_stubs],
     }
     (output / "SHA256SUMS").write_text(f"{digest}  {ipa.name}\n", encoding="utf-8")
     (output / "build-info.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

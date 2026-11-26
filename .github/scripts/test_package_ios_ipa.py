@@ -76,6 +76,78 @@ class IosIpaPackagingTests(unittest.TestCase):
             "--output", str(self.output), "--commit", COMMIT, "--run-url", RUN_URL,
         ], capture_output=True, text=True)
 
+    @staticmethod
+    def dylib_command(name):
+        value = name.encode() + b"\0"
+        size = (24 + len(value) + 7) // 8 * 8
+        return struct.pack("<6I", 0xC, size, 24, 2, 0, 0) + value.ljust(size - 24, b"\0")
+
+    @staticmethod
+    def empty_analytics_stub(name, *, code_size=0):
+        # The actual failing runner emits a dylib with empty __text, no symbols,
+        # an iOS 100 deployment command, and only a libSystem dependency.
+        section = struct.pack("<16s16sQQ8I", b"__text", b"__TEXT", 4096,
+                              code_size, 4096, 0, 0, 0, 0x80000400, 0, 0, 0)
+        segment = struct.pack("<II16sQQQQ4I", 0x19, 152, b"__TEXT", 0, 4096,
+                              0, 4096, 5, 5, 1, 0) + section
+        linkedit = struct.pack("<II16sQQQQ4I", 0x19, 72, b"__LINKEDIT",
+                               4096, 4096, 4096, 8, 1, 1, 0, 0)
+        install_name = IosIpaPackagingTests.dylib_command(f"@rpath/{name}.framework/{name}")
+        install_name = struct.pack("<I", 0xD) + install_name[4:]
+        commands = [segment, linkedit, install_name,
+                    struct.pack("<6I", 2, 24, 4096, 0, 4096, 8),
+                    struct.pack("<6I", 0x32, 24, 2, 100 << 16, 27 << 16, 0),
+                    struct.pack("<4I", 0x80000033, 16, 4096, 8),
+                    IosIpaPackagingTests.dylib_command("/usr/lib/libSystem.B.dylib")]
+        payload = struct.pack("<8I", 0xFEEDFACF, 0x0100000C, 0, 6,
+                              len(commands), sum(map(len, commands)), 0, 0) + b"".join(commands)
+        return payload.ljust(4096, b"\0") + bytes(8)
+
+    def test_omits_only_unreferenced_empty_analytics_stubs_and_discloses_them(self):
+        name = "FirebaseAnalytics"
+        framework = self.app / f"Frameworks/{name}.framework"
+        self.write_plist(framework / "Info.plist", {
+            "CFBundleExecutable": name, "MinimumOSVersion": "100.0",
+        })
+        binary = self.universal_binary(self.empty_analytics_stub(name))
+        (framework / name).write_bytes(binary)
+        result = self.run_packager()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads((self.output / "build-info.json").read_text())
+        self.assertEqual(report["excludedEmptyStubFrameworks"], [f"Frameworks/{name}.framework"])
+        self.assertEqual(report["excludedStaticFrameworks"], [])
+        with zipfile.ZipFile(self.output / report["artifact"]) as archive:
+            self.assertFalse(any(f"{name}.framework" in path for path in archive.namelist()))
+            self.assertIn("Payload/Runner.app/Frameworks/App.framework/App", archive.namelist())
+        self.assertEqual((framework / name).read_bytes(), binary)
+        self.assertEqual(plistlib.loads((framework / "Info.plist").read_bytes())["MinimumOSVersion"], "100.0")
+
+    def test_rejects_referenced_or_code_bearing_analytics_stubs_before_export(self):
+        name = "FirebaseAnalytics"
+        framework = self.app / f"Frameworks/{name}.framework"
+        self.write_plist(framework / "Info.plist", {
+            "CFBundleExecutable": name, "MinimumOSVersion": "100.0",
+        })
+        command = self.dylib_command(f"@rpath/{name}.framework/{name}")
+        consumer = struct.pack("<8I", 0xFEEDFACF, 0x0100000C, 0, 2,
+                               1, len(command), 0, 0) + command
+        for relative in ("Runner", "Frameworks/App.framework/App"):
+            with self.subTest(consumer=relative):
+                path = self.app / relative
+                original = path.read_bytes()
+                path.write_bytes(consumer)
+                (framework / name).write_bytes(self.empty_analytics_stub(name))
+                result = self.run_packager()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("iOS 15", result.stderr)
+                self.assertFalse(self.output.exists())
+                path.write_bytes(original)
+        (framework / name).write_bytes(self.empty_analytics_stub(name, code_size=4))
+        result = self.run_packager()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("iOS 15", result.stderr)
+        self.assertFalse(self.output.exists())
+
     def test_cli_exports_real_payload_with_modes_checksum_and_honest_provenance(self):
         result = self.run_packager()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
